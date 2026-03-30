@@ -41,21 +41,29 @@ class BleManager @Inject constructor(
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected
 
-    private val _status = MutableStateFlow("UNKNOWN")
+    private val _status = MutableStateFlow("Ожидание...")
     val status: StateFlow<String> = _status
 
-    // НОВОЕ: состояние сканирования для UI
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning
 
     private val handler = Handler(Looper.getMainLooper())
     private var scanning = false
 
+    private fun addToLog(message: String) {
+        val filteredKeywords = listOf("Соединение", "Связь потеряна", "RSSI", "Статус BLE")
+        if (filteredKeywords.any { message.contains(it) }) return
+
+        val timestamp = java.text.SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        val currentLines = _status.value.lines().filter { it.isNotBlank() && it != "Ожидание..." }
+        _status.value = (listOf("$timestamp: $message") + currentLines).take(10).joinToString("\n")
+    }
+
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            // Ищем по имени или по Service UUID из фильтра
             if (result.device.name == DEVICE_NAME) {
+                addToLog("Замок найден")
                 stopScan()
                 connect(result.device)
             }
@@ -66,20 +74,14 @@ class BleManager @Inject constructor(
     fun startScan() {
         if (scanning || _connected.value) return
         val scanner = bluetoothAdapter?.bluetoothLeScanner ?: return
-
-        // Фильтр критически важен для работы в фоне
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
-
-        val settings = ScanSettings.Builder()
-            // Используем BALANCED для стабильности в фоне
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
-            .build()
+        val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
 
         scanning = true
         _isScanning.value = true
+        addToLog("Поиск $DEVICE_NAME...")
         scanner.startScan(listOf(filter), settings, scanCallback)
+        handler.postDelayed({ stopScan() }, 15000)
     }
 
     @SuppressLint("MissingPermission")
@@ -90,23 +92,32 @@ class BleManager @Inject constructor(
         bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
     }
 
-    // НОВОЕ: Метод для ручного сброса (для кнопки)
     @SuppressLint("MissingPermission")
     fun manualReset() {
+        addToLog("Сброс связи...")
         stopScan()
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
         _connected.value = false
-        _status.value = "RESETTING..."
-        handler.postDelayed({ startScan() }, 500)
+        handler.postDelayed({ startScan() }, 1000)
     }
 
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
-        bluetoothGatt?.close()
-        // autoconnect = false для более быстрого подключения при обнаружении
-        bluetoothGatt = device.connectGatt(context, false, gattCallback)
+        handler.post { // Выполняем в основном потоке для стабильности
+            bluetoothGatt?.close()
+            bluetoothGatt = null
+
+            addToLog("Подключение...")
+
+            // Попробуем autoConnect = true (иногда на C3 работает стабильнее)
+            bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                device.connectGatt(context, false, gattCallback)
+            }
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -114,17 +125,13 @@ class BleManager @Inject constructor(
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 _connected.value = true
-                gatt.discoverServices()
+                handler.postDelayed({ gatt.discoverServices() }, 600)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 _connected.value = false
-                _status.value = "DISCONNECTED"
-                controlChar = null
-                // Обязательно закрываем старый GATT объект
+                _status.value = "Связь потеряна"
                 gatt.close()
                 if (bluetoothGatt == gatt) bluetoothGatt = null
-
-                // Перезапуск сканирования через задержку
-                handler.postDelayed({ startScan() }, 2000)
+                handler.postDelayed({ startScan() }, 3000)
             }
         }
 
@@ -136,6 +143,10 @@ class BleManager @Inject constructor(
             val statusChar = service.getCharacteristic(STATUS_UUID)
 
             statusChar?.let { char ->
+                // ШАГ 1: Читаем текущее состояние принудительно
+                handler.postDelayed({ gatt.readCharacteristic(char) }, 200)
+
+                // ШАГ 2: Подписываемся на Notify
                 gatt.setCharacteristicNotification(char, true)
                 val descriptor = char.getDescriptor(CCCD_UUID)
                 descriptor?.let { desc ->
@@ -151,15 +162,33 @@ class BleManager @Inject constructor(
             startRssiLoop(gatt)
         }
 
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            if (characteristic.uuid == STATUS_UUID) _status.value = String(value).trim()
+        // ШАГ 3: Получаем результат чтения (убирает UNKNOWN)
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == STATUS_UUID) {
+                val msg = String(value).trim()
+                addToLog(msg) // Должно добавить "LOCKED" или "UNLOCKED"
+            }
         }
+
+
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == STATUS_UUID) {
+                val msg = String(characteristic.value ?: byteArrayOf()).trim()
+                addToLog("Статус: $msg")
+            }
+        }
+
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            if (characteristic.uuid == STATUS_UUID) {
+                addToLog(String(value).trim())
+            }
+        }
+
 
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (characteristic.uuid == STATUS_UUID) {
-                _status.value = String(characteristic.value ?: byteArrayOf()).trim()
-            }
+            if (characteristic.uuid == STATUS_UUID) addToLog(String(characteristic.value).trim())
         }
 
         override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
@@ -173,7 +202,7 @@ class BleManager @Inject constructor(
             override fun run() {
                 if (_connected.value) {
                     gatt.readRemoteRssi()
-                    handler.postDelayed(this, 1500)
+                    handler.postDelayed(this, 2000)
                 }
             }
         })
@@ -194,3 +223,4 @@ class BleManager @Inject constructor(
         }
     }
 }
+

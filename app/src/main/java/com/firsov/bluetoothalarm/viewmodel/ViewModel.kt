@@ -5,8 +5,10 @@ import androidx.lifecycle.viewModelScope
 import com.firsov.bluetoothalarm.ble.BleManager
 import com.firsov.bluetoothalarm.data.model.LockState
 import dagger.hilt.android.lifecycle.HiltViewModel
-import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import javax.inject.Inject
 
 @HiltViewModel
@@ -18,50 +20,25 @@ class LockViewModel @Inject constructor(
     val rssi = bleManager.rssi
     val isScanning = bleManager.isScanning
 
-    private val _isAutoMode = MutableStateFlow(false)
-    val isAutoMode: StateFlow<Boolean> = _isAutoMode
+    // Пробрасываем весь текст лога для окна в нижней части экрана
+    val status = bleManager.status
 
-    // Время последнего ручного закрытия
-    private var lastManualLockTime: Long = 0
+    // Исправленная логика определения состояния замка
+    val state: StateFlow<LockState> = bleManager.status.map { logText ->
+        // Разбиваем лог на строки и берем первую непустую
+        val lastLogLine = logText.lines().firstOrNull { it.isNotBlank() } ?: ""
 
-    val state: StateFlow<LockState> = bleManager.status.map {
-        when(it) {
-            "ALARM" -> LockState.ALARM
-            "LOCKED" -> LockState.LOCKED
-            "UNLOCKED" -> LockState.UNLOCKED
+        when {
+            // Ищем вхождение слова в последнюю добавленную строку лога
+            lastLogLine.contains("ALARM", ignoreCase = true) -> LockState.ALARM
+            lastLogLine.contains("UNLOCKED", ignoreCase = true) -> LockState.UNLOCKED
+            lastLogLine.contains("LOCKED", ignoreCase = true) -> LockState.LOCKED
             else -> LockState.UNKNOWN
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), LockState.UNKNOWN)
 
-    init {
-        observeAutoLogic()
-    }
-
-    private fun observeAutoLogic() {
-        viewModelScope.launch {
-            combine(connected, rssi, _isAutoMode) { conn, r, auto -> Triple(conn, r, auto) }
-                .collect { (conn, r, auto) ->
-                    val currentTime = System.currentTimeMillis()
-
-                    // ПРОВЕРКА ДЛЯ АВТО-ОТКРЫТИЯ:
-                    // 1. Связь есть, режим "Авто" включен, сигнал > -60, байк закрыт
-                    // 2. С момента ручного LOCK прошло БОЛЕЕ 10 секунд (10000 мс)
-                    if (conn && auto && r > -60 && state.value == LockState.LOCKED) {
-                        if (currentTime - lastManualLockTime > 10000) {
-                            unlock()
-                        }
-                    }
-                }
-        }
-    }
-
-    fun toggleAuto(enabled: Boolean) {
-        _isAutoMode.value = enabled
-    }
 
     fun lock() {
-        // Запоминаем время нажатия, чтобы дать себе 10 секунд уйти
-        lastManualLockTime = System.currentTimeMillis()
         bleManager.sendCommand("LOCK")
     }
 
@@ -73,8 +50,14 @@ class LockViewModel @Inject constructor(
         bleManager.sendCommand("ALARM_OFF")
     }
 
+    fun startScan() {
+        bleManager.startScan()
+    }
+
+    // Добавим функцию сброса, раз мы ее обсуждали для UI
     fun refreshConnection() {
         bleManager.manualReset()
     }
 }
+
 
