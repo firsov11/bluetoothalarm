@@ -29,7 +29,6 @@ class BleManager @Inject constructor(
     private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     private var bluetoothGatt: BluetoothGatt? = null
-    private var controlChar: BluetoothGattCharacteristic? = null
 
     private val bluetoothAdapter: BluetoothAdapter? by lazy {
         (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
@@ -105,13 +104,10 @@ class BleManager @Inject constructor(
 
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
-        handler.post { // Выполняем в основном потоке для стабильности
+        handler.post {
             bluetoothGatt?.close()
             bluetoothGatt = null
-
             addToLog("Подключение...")
-
-            // Попробуем autoConnect = true (иногда на C3 работает стабильнее)
             bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
             } else {
@@ -139,56 +135,45 @@ class BleManager @Inject constructor(
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) return
             val service = gatt.getService(SERVICE_UUID) ?: return
-            controlChar = service.getCharacteristic(CONTROL_UUID)
             val statusChar = service.getCharacteristic(STATUS_UUID)
 
             statusChar?.let { char ->
-                // ШАГ 1: Читаем текущее состояние принудительно
-                handler.postDelayed({ gatt.readCharacteristic(char) }, 200)
-
-                // ШАГ 2: Подписываемся на Notify
                 gatt.setCharacteristicNotification(char, true)
                 val descriptor = char.getDescriptor(CCCD_UUID)
                 descriptor?.let { desc ->
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        gatt.writeDescriptor(desc)
-                    }
+                    desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    gatt.writeDescriptor(desc)
                 }
             }
             startRssiLoop(gatt)
         }
 
-        // ШАГ 3: Получаем результат чтения (убирает UNKNOWN)
-        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == STATUS_UUID) {
-                val msg = String(value).trim()
-                addToLog(msg) // Должно добавить "LOCKED" или "UNLOCKED"
+        @SuppressLint("MissingPermission")
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS && descriptor.characteristic.uuid == STATUS_UUID) {
+                // ШАГ 2: ПОДПИСКА ОК — ПИНАЕМ ПЛАТУ ДЛЯ СТАТУСА
+                handler.postDelayed({
+                    sendCommand("STAT")
+                }, 300)
             }
         }
 
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) processIncomingData(value)
+        }
 
         @Suppress("DEPRECATION")
         override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == STATUS_UUID) {
-                val msg = String(characteristic.value ?: byteArrayOf()).trim()
-                addToLog("Статус: $msg")
-            }
+            if (status == BluetoothGatt.GATT_SUCCESS) processIncomingData(characteristic.value)
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            if (characteristic.uuid == STATUS_UUID) {
-                addToLog(String(value).trim())
-            }
+            processIncomingData(value)
         }
-
 
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (characteristic.uuid == STATUS_UUID) addToLog(String(characteristic.value).trim())
+            processIncomingData(characteristic.value)
         }
 
         override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
@@ -196,9 +181,16 @@ class BleManager @Inject constructor(
         }
     }
 
+    private fun processIncomingData(value: ByteArray?) {
+        value?.let {
+            val msg = String(it).trim()
+            if (msg.isNotEmpty()) addToLog(msg)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private fun startRssiLoop(gatt: BluetoothGatt) {
         handler.post(object : Runnable {
-            @SuppressLint("MissingPermission")
             override fun run() {
                 if (_connected.value) {
                     gatt.readRemoteRssi()
@@ -209,16 +201,15 @@ class BleManager @Inject constructor(
     }
 
     @SuppressLint("MissingPermission")
-    fun sendCommand(cmd: String) {
+    fun sendCommand(command: String) {
         val gatt = bluetoothGatt ?: return
-        val char = controlChar ?: return
-        val bytes = cmd.toByteArray()
+        val service = gatt.getService(SERVICE_UUID) ?: return
+        val char = service.getCharacteristic(CONTROL_UUID) ?: return
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            gatt.writeCharacteristic(char, command.toByteArray(), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         } else {
-            @Suppress("DEPRECATION")
-            char.value = bytes
-            @Suppress("DEPRECATION")
+            char.value = command.toByteArray()
             gatt.writeCharacteristic(char)
         }
     }

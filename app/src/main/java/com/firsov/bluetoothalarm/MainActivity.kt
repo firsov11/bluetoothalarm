@@ -8,10 +8,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.core.content.ContextCompat
 import com.firsov.bluetoothalarm.ui.LockScreen
+import com.firsov.bluetoothalarm.ui.theme.BluetoothAlarmTheme
 import com.firsov.bluetoothalarm.viewmodel.LockViewModel
 import dagger.hilt.android.AndroidEntryPoint
 
@@ -20,9 +22,12 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: LockViewModel by viewModels()
 
+    // ПРОВЕРЬ: этот блок должен быть именно здесь, внутри тела класса
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* ничего не делаем автоматически */ }
+    ) { permissions ->
+        // Здесь можно обработать результат, если нужно
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -30,8 +35,12 @@ class MainActivity : ComponentActivity() {
         checkAndRequestPermissions()
 
         setContent {
-            MaterialTheme {
-                Surface {
+            // Твоя кастомная тема
+            BluetoothAlarmTheme {
+                Surface(
+                    modifier = androidx.compose.ui.Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     LockScreen(viewModel = viewModel)
                 }
             }
